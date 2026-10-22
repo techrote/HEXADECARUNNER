@@ -1,0 +1,47 @@
+name: Benchmark
+run-name: Benchmark ${{ inputs.workers }} workers / ${{ inputs.tasks }} tasks
+on:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: Requested worker jobs; account-wide concurrency may be lower.
+        type: choice
+        options: ['4', '8', '16', '32']
+        default: '4'
+      tasks:
+        description: Fixed total tasks; use at least 4 times the worker count.
+        type: string
+        default: '128'
+      steps:
+        description: Diffusion iterations per task; keep fixed when comparing worker counts.
+        type: string
+        default: '4000'
+      baseline:
+        description: Run the identical workload on one runner first.
+        type: boolean
+        default: true
+      resume_run_id:
+        description: Compatible prior Benchmark run in this repo, or 0 for a fresh trial.
+        type: string
+        default: '0'
+      timeout_minutes:
+        description: Per-compute-job timeout, 1 to 360 minutes.
+        type: string
+        default: '30'
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  distributed:
+    uses: ./.github/workflows/distributed.yml
+    with:
+      name: bench
+      workers: ${{ fromJSON(inputs.workers) }}
+      tasks: ${{ fromJSON(inputs.tasks) }}
+      steps: ${{ fromJSON(inputs.steps) }}
+      baseline: ${{ inputs.baseline }}
+      resume_run_id: ${{ fromJSON(inputs.resume_run_id) }}
+      timeout_minutes: ${{ fromJSON(inputs.timeout_minutes) }}
