@@ -17,16 +17,32 @@ def timestamp(value):
 
 
 def elapsed(start, end):
-    return max(0.0, timestamp(end) - timestamp(start)) if start and end else None
+    if not start or not end:
+        return None
+    duration = timestamp(end) - timestamp(start)
+    return duration if duration >= 0 else None
 
 
 def summarize(run, jobs, namespace):
-    rows = []
-    for job in jobs:
+    rows, seen = [], set()
+    carried_forward = 0
+    # Partial reruns can repeat untouched executions under new job IDs. Keep the
+    # earliest attempt's timestamps so queue and runtime are not counted twice.
+    ordered = sorted(jobs, key=lambda job: (job.get('run_attempt') or 1, job['id']))
+    for job in ordered:
         name = job['name']
         # Exact namespace suffix: do not accidentally include another workflow call.
         if not re.search(r'(?:^| / )' + re.escape(namespace) + r' / (?:plan|baseline|worker-\d+|aggregate)$', name):
             continue
+        if (job['status'] == 'completed' and job.get('runner_id')
+                and job.get('started_at') and job.get('completed_at')):
+            execution = (name, job['runner_id'], job['started_at'], job['completed_at'])
+        else:
+            execution = ('job-id', job['id'])
+        if execution in seen:
+            carried_forward += 1
+            continue
+        seen.add(execution)
         compute = next((s for s in job.get('steps', []) if s['name'] == 'Compute'), None)
         download = upload = 0.0
         for step in job.get('steps', []):
@@ -49,12 +65,14 @@ def summarize(run, jobs, namespace):
             'completed_job_runner_minutes': completed_seconds / 60,
             'completed_job_rounded_minute_estimate': sum(math.ceil((row['job_seconds'] or 0) / 60) for row in rows),
             'all_selected_jobs_completed': bool(rows) and all(row['status'] == 'completed' for row in rows),
-            'jobs': rows,
-            'notes': ['Snapshot includes all available attempts, not just successful jobs.',
+            'carried_forward_records_ignored': carried_forward, 'jobs': rows,
+            'notes': ['Snapshot includes physical executions from all attempts, not just successes.',
+                      'Carried-forward completed jobs with identical name/runner/start/end are counted once.',
+                      'Only the selected namespace is counted; caller jobs such as quality are excluded.',
                       'During aggregation, its own duration and final upload are not yet complete.',
                       'Runner minutes are observed job durations; rounded estimate is NOT an invoice.',
                       'Artifact timings include action startup, compression and transfer, not just network.',
-                      'Queue time is null when the API does not supply job created_at.',
+                      'Queue time is null when creation time is absent or later than start time.',
                       'Collect again after completion for final full-pipeline runner minutes.']}
 
 
@@ -64,6 +82,7 @@ def render(report):
     lines = ['\n## GitHub scheduling and artifact overhead\n',
              f"Completed-job runner minutes at snapshot: **{report['completed_job_runner_minutes']:.3f}**.",
              f"All selected jobs completed: **{report['all_selected_jobs_completed']}**. This is not billing data.\n",
+             f"Carried-forward records ignored: {report['carried_forward_records_ignored']}.\n",
              '| Job | Queue s | Setup to compute s | Compute step s | Download steps s | Upload steps s | Job s |',
              '|---|---:|---:|---:|---:|---:|---:|']
     def fmt(value):

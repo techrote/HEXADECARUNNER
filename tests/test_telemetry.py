@@ -1,5 +1,5 @@
 import unittest
-from scripts.telemetry import summarize
+from scripts.telemetry import summarize, elapsed
 
 
 class TelemetryTests(unittest.TestCase):
@@ -21,6 +21,26 @@ class TelemetryTests(unittest.TestCase):
         self.assertEqual(report['jobs'][0]['setup_to_compute_seconds'], 10)
         self.assertEqual(report['jobs'][0]['artifact_upload_step_seconds'], 5)
 
+
+    def test_partial_rerun_deduplicates_untouched_execution(self):
+        run = {'id': 12, 'status': 'in_progress', 'head_sha': 'abc'}
+        original = {'id': 1, 'run_attempt': 1, 'runner_id': 100,
+                    'name': 'distributed / hex / worker-0', 'status': 'completed',
+                    'created_at': '2026-01-01T00:00:00Z',
+                    'started_at': '2026-01-01T00:00:02Z',
+                    'completed_at': '2026-01-01T00:01:02Z', 'steps': []}
+        carried = {**original, 'id': 2, 'run_attempt': 2,
+                   'created_at': '2026-01-01T00:02:00Z'}
+        rerun = {**carried, 'id': 3, 'runner_id': 101,
+                 'started_at': '2026-01-01T00:02:02Z',
+                 'completed_at': '2026-01-01T00:02:32Z'}
+        report = summarize(run, [carried, rerun, original], 'hex')
+        self.assertEqual(report['carried_forward_records_ignored'], 1)
+        self.assertEqual(len(report['jobs']), 2)
+        self.assertEqual(report['completed_job_runner_minutes'], 1.5)
+        self.assertEqual(report['jobs'][0]['id'], 1)
+        self.assertEqual(report['jobs'][0]['queue_seconds'], 2)
+        self.assertIsNone(elapsed('2026-01-01T00:02:00Z', '2026-01-01T00:00:02Z'))
 
 if __name__ == '__main__':
     unittest.main()

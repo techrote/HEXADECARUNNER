@@ -6,6 +6,7 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import hashlib
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import platform
@@ -254,7 +255,18 @@ def run_worker(manifest: dict, *, index: int, output: Path, baseline: bool = Fal
     if resume is not None:
         if not resume.is_dir():
             raise ValueError("resume directory does not exist")
-        for path in sorted(resume.rglob("task-*.json")):
+        summaries = list(resume.rglob("worker.json"))
+        receipt_paths = sorted(resume.rglob("task-*.json"))
+        if not summaries and not receipt_paths:
+            raise ValueError("resume directory contains no published checkpoints")
+        for path in summaries:
+            previous = read_json(path)
+            if (previous.get("schema") != SCHEMA
+                    or previous.get("experiment_id") != manifest["experiment_id"]
+                    or previous.get("role") != ("baseline" if baseline else "worker")
+                    or previous.get("index") != index):
+                raise ValueError("checkpoint summary identity mismatch")
+        for path in receipt_paths:
             receipt = read_json(path)
             key = receipt.get("task_id")
             if key not in lookup:
@@ -270,7 +282,9 @@ def run_worker(manifest: dict, *, index: int, output: Path, baseline: bool = Fal
     processes = min(manifest["processes"], cpu_count(), len(tasks))
     failures, completed = {}, set(cached)
     if todo:
-        with ProcessPoolExecutor(max_workers=processes) as pool:
+        method = "forkserver" if "forkserver" in multiprocessing.get_all_start_methods() else "spawn"
+        context = multiprocessing.get_context(method)
+        with ProcessPoolExecutor(max_workers=processes, mp_context=context) as pool:
             futures = {pool.submit(execute_task, task, config): task["id"] for task in todo}
             for future in as_completed(futures):
                 key = futures[future]
@@ -310,9 +324,16 @@ def overlap(summaries: list[dict]) -> int:
 
 
 def reduce_results(manifest: dict, inputs: Path, *, require_baseline: bool = True,
-                   run_id: str = "local") -> dict:
+                   run_id: str = "local", upstream_workers: str = "success",
+                   upstream_baseline: str = "success") -> dict:
     validate_manifest(manifest)
-    latest = {}
+    # A failed newest job may not have uploaded a summary at all. Do not let an
+    # older successful artifact turn such a rerun into a green reduction report.
+    if upstream_workers != "success":
+        raise ValueError(f"upstream worker phase is {upstream_workers}, not success")
+    if require_baseline and upstream_baseline != "success":
+        raise ValueError(f"upstream baseline is {upstream_baseline}, not success")
+    latest, seen_attempts = {}, set()
     for path in sorted(inputs.rglob("worker.json")):
         summary = read_json(path)
         if summary.get("experiment_id") != manifest["experiment_id"] or summary.get("run_id") != run_id:
@@ -323,8 +344,9 @@ def reduce_results(manifest: dict, inputs: Path, *, require_baseline: bool = Tru
         integer(index, 0, 0 if role == "baseline" else manifest["workers"] - 1, "summary index")
         attempt = integer(summary.get("run_attempt"), 1, 1000, "summary attempt")
         key = (role, index)
-        if key in latest and attempt == latest[key][0]["run_attempt"]:
+        if (key, attempt) in seen_attempts:
             raise ValueError(f"duplicate worker summary for {key}, attempt {attempt}")
+        seen_attempts.add((key, attempt))
         if key not in latest or attempt > latest[key][0]["run_attempt"]:
             latest[key] = (summary, path.parent)
     expected = {("worker", i) for i in range(manifest["workers"])}
@@ -380,6 +402,8 @@ def reduce_results(manifest: dict, inputs: Path, *, require_baseline: bool = Tru
         reasons.append("baseline not run")
     if any(item["restored_tasks"] for item in all_summaries):
         reasons.append("checkpoint reuse: not a fresh performance trial")
+    if any(item["run_attempt"] != 1 for item in all_summaries):
+        reasons.append("workflow rerun: not a fresh single-attempt trial")
     if total_attempts != total_receipts:
         reasons.append("task retries: not a clean performance trial")
     if len({item["processes"] for item in all_summaries}) != 1:
@@ -453,6 +477,10 @@ def main(argv: list[str] | None = None) -> int:
     aggregate.add_argument("--inputs", type=Path, required=True)
     aggregate.add_argument("--output", type=Path, required=True)
     aggregate.add_argument("--no-baseline", action="store_true")
+    aggregate.add_argument("--upstream-workers", default="success",
+                           choices=("success", "failure", "cancelled", "skipped"))
+    aggregate.add_argument("--upstream-baseline", default="success",
+                           choices=("success", "failure", "cancelled", "skipped"))
     args = parser.parse_args(argv)
     if args.command == "plan":
         tasks = read_json(within(args.workdir, args.task_file)) if args.task_file else None
@@ -474,7 +502,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(summary, indent=2))
         return 0 if summary["status"] == "complete" else 1
     try:
-        report = reduce_results(manifest, args.inputs, require_baseline=not args.no_baseline, run_id=run_id)
+        report = reduce_results(manifest, args.inputs, require_baseline=not args.no_baseline,
+                                run_id=run_id, upstream_workers=args.upstream_workers,
+                                upstream_baseline=args.upstream_baseline)
     except (ValueError, KeyError, TypeError, OSError) as error:
         report = {"schema": SCHEMA, "status": "failed", "error": str(error)}
     atomic_json(args.output / "report.json", report)
