@@ -1,0 +1,49 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Unit and local topology integration tests
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -v 2>&1 | tee unittest.log
+      - name: Validate workflow syntax
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -color
+      - name: Preserve source and test evidence
+        if: always()
+        run: tar -czf source-test-evidence.tar.gz hexrunner.py tests examples scripts .github README.md AGENTS.md unittest.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: quality-a${{ github.run_attempt }}
+          path: source-test-evidence.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+  distributed:
+    needs: quality
+    uses: ./.github/workflows/distributed.yml
+    with:
+      name: smoke
+      workers: 4
+      processes: 4
+      tasks: 64
+      cells: 48
+      steps: 1000
+      baseline: true
