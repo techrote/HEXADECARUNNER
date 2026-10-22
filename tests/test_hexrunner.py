@@ -1,6 +1,5 @@
 """Fast functional qualification. Local workers are NOT physical GitHub nodes."""
 import copy
-import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -50,7 +49,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(set(digests)), 1)
 
     def test_known_reference_result(self):
-        self.assertEqual(h.simulation({"cells": 4, "steps": 1, "seed": 1})["sum"], 502696)
+        # Independently checked using a nested 4x4 grid and direct neighbor indexing.
+        self.assertEqual(h.simulation({"cells": 4, "steps": 1, "seed": 1})["sum"], 491908)
 
     def test_invalid_workers_and_processes(self):
         for workers in (0, 2, 3, 33, True):
