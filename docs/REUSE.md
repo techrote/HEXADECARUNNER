@@ -1,8 +1,12 @@
-# Reusing the workflow
+# Reuse contract — other repositories
+
+**Navigation:** [Documentation index](INDEX.md) · [Agent playbook](AGENT_PLAYBOOK.md) · [Operations](OPERATIONS.md) · [Architecture](ARCHITECTURE.md) · [Examples](../examples/)
+
+This document is the **canonical interface contract** for a consuming repository: the exact reusable-workflow caller, supported inputs and adapter/result protocol. For agent steps and admission gates, see the [playbook](AGENT_PLAYBOOK.md); for recovery and reporting procedures, see [operations](OPERATIONS.md).
 
 ## External repository caller
 
-Commit a task list and adapter to the consuming repository, using the examples as a starting point. Select a reviewed HEXADECARUNNER commit. Replace both `FULL_FRAMEWORK_COMMIT_SHA` occurrences below with that same 40-character SHA; the workflow reference cannot be an expression.
+In the **consuming** repository, commit a Python task adapter and task JSON file, then a workflow like the following. Replace **both** `FULL_FRAMEWORK_COMMIT_SHA` occurrences with the **same reviewed 40-character hexadecimal framework commit SHA**. GitHub requires the reusable workflow `uses` reference to be a literal, not a runtime expression.
 
 ```yaml
 name: Distributed simulation CI
@@ -27,52 +31,86 @@ jobs:
       timeout_minutes: 30
 ```
 
-Do not add `secrets: inherit`. The caller source is checked out in `workload`; the pinned framework is checked out separately in `framework`. Adapter paths and task-file paths are relative to `workload` and cannot escape it. The adapter's current working directory is the workload checkout. External callers must explicitly supply `framework_ref`; internal repository workflows use their own event SHA by default.
+The caller source is checked out into `workload/` at the caller's GitHub event SHA; the HEXADECARUNNER code is independently checked out into `framework/` at `framework_ref`. Task and adapter paths are relative to the **workload root** and may not escape it. The adapter runs with the caller checkout as its working directory.
 
-The caller controls the workflow reference and the framework checkout reference. GitHub does not automatically make those two strings equal: review them together and keep them identical. Pinning avoids accidentally mixing workflow code from one release with runner code from another.
+**Do not** omit `framework_ref` in an external repository, use a moving tag/branch for either reference, or add `secrets: inherit`. GitHub does not enforce equality between the two framework references automatically: inspect them together. Two calls in one parent workflow run require **different** `name` values to avoid artifact collisions. Avoid wrapping a 32-worker call in another fan-out matrix.
 
-## Inputs
+## Input reference
 
-| Input | Default | Contract |
+These values are defined by [`distributed.yml`](../.github/workflows/distributed.yml); the workflow schema and `hexrunner.py` are decisive if an implementation changes.
+
+| Input | Default | Accepted behavior / bounds |
 |---|---|---|
-| `workers` | 4 | 1, 4, 8, 16, or 32 |
-| `processes` | 4 | 1..4; bounded by CPU allocation and assigned tasks |
-| `tasks` | 128 | Reference workload only; 1..4096 total, at least worker count |
-| `cells` | 48 | Reference periodic grid width/height, 4..128 |
-| `steps` | 4000 | Reference diffusion iterations, 1..100000 |
-| `baseline` | true | Same total task set on one runner before the worker phase |
-| `name` | hex | Unique artifact namespace within the caller run; letters/digits/underscore/hyphen, 1..32 chars |
-| `framework_ref` | empty | Full framework commit SHA; required outside this repository |
-| `task_file` | empty | Optional checked-in JSON list replacing generated tasks |
-| `adapter` | empty | Optional checked-in Python task adapter; empty selects the reference kernel |
-| `resume_run_id` | 0 | Compatible published checkpoint run in the same caller repository |
-| `retries` | 1 | Additional per-task attempts, 0..3 |
-| `task_timeout` | 300 | Adapter invocation timeout in seconds, 1..18000; reference kernel uses job timeout |
-| `timeout_minutes` | 30 | Per baseline/worker job timeout, 1..360 |
+| `workers` | 4 | 1, 4, 8, 16, 32 (1 is mainly for internal/local scenarios; manual Benchmark offers 4/8/16/32) |
+| `processes` | 4 | 1–4 per compute runner; actual use capped by observed CPUs and assigned tasks |
+| `tasks` | 128 | Total tasks for *generated reference workload* only; 1–4096, must be at least worker count |
+| `cells` | 48 | Reference diffusion grid side, 4–128 |
+| `steps` | 4000 | Reference diffusion iterations per task, 1–100000 |
+| `baseline` | true | Execute **the entire identical task set** on one runner before workers |
+| `name` | hex | Unique artifact namespace within parent run; 1–32 ASCII letters/digits/_/- |
+| `framework_ref` | empty | Full 40-character framework SHA; **mandatory for cross-repo callers** |
+| `task_file` | empty | Checked-in JSON task list relative to `workload`; if empty, generate reference tasks |
+| `adapter` | empty | Checked-in Python adapter relative to `workload`; if empty, run reference kernel |
+| `resume_run_id` | 0 | Nonzero: published compatible checkpoints from another run **in the same caller repository** |
+| `retries` | 1 | Additional per-task attempts, 0–3; retries invalidate fresh speedup comparison |
+| `task_timeout` | 300 | Adapter task deadline in seconds, 1–18000; reference kernel uses the job timeout |
+| `timeout_minutes` | 30 | Baseline/worker job timeout, 1–360 minutes |
 
-Two workflow calls in one parent run must use different `name` values. Do not use a caller matrix to multiply a 32-worker pool accidentally. This prototype does not stage large external datasets or build native projects automatically; adapters must use available dependencies or manage their own reviewed setup without concurrent build races.
+When supplying a custom `task_file`, the JSON determines the total task count; `tasks`/`cells`/`steps` only generate the reference set when `task_file` is empty. A custom task list with the built-in reference kernel must still contain the reference payload keys (`seed`, `cells`, `steps`). Do not assume arbitrary JSON works without an adapter.
 
-## Task protocol
+## Task and adapter contract
 
-Input task list:
+A checked-in task list is a JSON **array** of 1–4096 entries; each entry has **exactly** `id` and `payload`. `id` must be unique and valid under the current source's ID validation. `payload` must be a JSON object. Non-finite numbers, duplicate object keys, duplicate IDs and malformed data are rejected. The manifest sorts tasks by ID and assigns positions modulo the worker count; this is deterministic/count-balanced, not runtime-balanced. See the [sample task list](../examples/tasks.json).
+
+For every task, the checked-in Python adapter:
+
+- Reads a **single complete task object** on standard input. The runner invokes it with `sys.executable` directly, not via a shell.
+- Emits **one deterministic JSON result**, max 1 MiB, to **stdout** and nothing else there. Diagnostics belong on stderr; exit nonzero on error. Bad JSON, oversized results, timeout or nonzero exit triggers a failed attempt.
+- Returns results independent of run time, host identity, paths, timing, process scheduling or nondeterministic iteration order. Baseline and distributed tasks undergo **exact** result equality, not tolerance-based comparison.
+- Avoids side effects or makes them independently idempotent: timeout, artifact loss and retry mean *at least once*, not exactly once. Scope temporary/output files by task ID; do not race builds among local processes.
+- Explicitly limits native BLAS/compiler/thread pool parallelism or uses `processes: 1` when one task already saturates its worker.
+
+Minimal example, matching [`examples/adapter.py`](../examples/adapter.py) and [`examples/tasks.json`](../examples/tasks.json):
 
 ```json
 [
-  {"id":"seed-000","payload":{"seed":0,"scenario":"settling"}},
-  {"id":"seed-001","payload":{"seed":1,"scenario":"settling"}},
-  {"id":"seed-002","payload":{"seed":2,"scenario":"settling"}},
-  {"id":"seed-003","payload":{"seed":3,"scenario":"settling"}}
+  {"id":"case-0","payload":{"samples":[1,2,3]}},
+  {"id":"case-1","payload":{"samples":[4,5,6]}},
+  {"id":"case-2","payload":{"samples":[7,8,9]}},
+  {"id":"case-3","payload":{"samples":[10,11,12]}}
 ]
 ```
 
-The adapter receives one entire object on stdin. Return one deterministic JSON result (at most 1 MiB) on stdout. Durations and host metadata should not be part of that result, because exact baseline equality would then fail. The runner records execution durations separately. Log to stderr. A nonzero exit, timeout, invalid JSON or non-finite output is a failed attempt.
+For floating-point workloads that vary across machines, design a **documented, justified stable representation** inside the adapter (e.g. canonical quantized summaries), prove it is scientifically meaningful and independently test discrepancies. Do not return a constant or suppress genuine numerical failures just to satisfy exact equality. Large binary results need a separately designed publication mechanism; only a compact JSON receipt is supported here.
 
-For numeric workloads with unavoidable floating-point variation, implement a documented canonicalization or tolerance-aware summary in the adapter. Do not simply discard failures or precision differences until the reducer passes. This first reducer intentionally uses exact result equality.
+## Source identity, dependencies and security
 
-For compiler/test workloads, return a compact receipt such as passed test IDs, stable output hashes and operation counts. Keep large binary outputs outside the JSON receipt; the current prototype does not provide a general binary-output publication protocol. Native tools may launch their own thread pools: bound their thread count or choose `processes: 1` to avoid oversubscription.
+The manifest contains the caller source revision, framework revision, adapter path/file SHA-256, task definitions, worker/process configuration, retry/timeout settings and the canonical `experiment_id`. A hash detects mismatched *content*; it does not authenticate untrusted workers or make the adapter a sandbox. Read [architecture — source and manifest identity](ARCHITECTURE.md#source-and-manifest-identity).
 
-## Recovery and outputs
+Workers use GitHub-hosted `ubuntu-24.04` with Python 3.12, standard actions and no inherited secrets. **The workflow does not build your native project, pip-install arbitrary requirements or stage external data.** If the consumer depends on compiled programs or third-party packages, qualify their presence/setup separately before asserting that this stock caller will succeed. Check [agent applicability](AGENT_PLAYBOOK.md#applicability-gate). Never run unreviewed external pull-request code with privileged tokens.
 
-Re-run failed jobs to reuse compatible published results from prior attempts in the same workflow run. For a different run, use the same source/configuration/namespace with `resume_run_id`. No credentials beyond the caller's read-only GitHub token are needed for same-repository recovery. Artifact expiry, removed artifacts, foreign sources or missing checkpoint publication can make recovery impossible; the workflow must not claim those tasks were preserved.
+## Local rehearsal
 
-The workflow returns `report_artifact` and, on successful reduction, `result_sha256`. Download the named artifact for JSON/Markdown reports. Check the Actions job conclusion too: output presence alone is not proof of success. A failed reducer still publishes diagnostic evidence where possible.
+For agent-operated full local plan → baseline → four workers → reduce commands from a consumer checkout, see [playbook — local rehearsal](AGENT_PLAYBOOK.md#local-rehearsal). To test this repository's bundled adapter directly:
+
+```sh
+printf '%s\n' '{"id":"case-0","payload":{"samples":[1,2,3]}}' | python examples/adapter.py
+python -m unittest discover -s tests -v
+```
+
+Local emulation validates manifest/receipt/reducer protocol, **not** hosted runner overlap or the consumer's dependency environment. A new source commit changes the caller source identity, and a new worker count changes the manifest identity: do not reuse foreign checkpoints across those changes.
+
+## Outputs and recovery
+
+On completion, the reusable workflow exposes:
+
+| Output | Meaning |
+|---|---|
+| `report_artifact` | Namespace-scoped artifact name `NAME-report-aATTEMPT` containing reducer JSON/Markdown, manifest and scheduling telemetry |
+| `result_sha256` | Canonical distributed result digest when reduction passes; **empty on reducer failure** |
+
+Check the Actions **job conclusion** as well as output presence; diagnostic artifacts can be uploaded even on a failing run. Expect `NAME-plan-aATTEMPT`, optional `NAME-baseline-aATTEMPT`, `NAME-worker-INDEX-aATTEMPT`, and `NAME-report-aATTEMPT`. They default to **seven days** retention. See [architecture — reduction and evidence](ARCHITECTURE.md#reduction-and-evidence).
+
+**Automatic rerun:** re-running failed jobs may restore a compatible checkpoint from a previous attempt of the *same workflow run*. A worker with no published checkpoint recomputes its shard. **Explicit `resume_run_id`:** restore from a compatible completed or partial run *within the same repository*; if no published compatible data exists, fail rather than pretend it was restored. Latest attempts and upstream job conclusions are authoritative. An upload after an ordinary task failure is best effort, **not** periodic persistence; killed runners may lose unfinished/unuploaded work. See [operations — recovery](OPERATIONS.md#recover-work-after-failure) and [architecture — worker lifecycle](ARCHITECTURE.md#worker-lifecycle-and-recovery).
+
+Fresh speedup is suppressed after a retry, checkpoint reuse, rerun, no baseline or unequal per-runner process counts. Correctness can still pass. See [operations — performance claim discipline](OPERATIONS.md#performance-claim-discipline).
