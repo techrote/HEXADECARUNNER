@@ -112,7 +112,7 @@ class DocumentationNavigationTest(unittest.TestCase):
                         failures.append(f"{source.relative_to(ROOT)}:{line_number}: "
                                         f"root-absolute link {raw!r}")
                         continue
-                    target = (source.parent / path).resolve()
+                    target = source if not path else (source.parent / path).resolve()
                     if not target.is_relative_to(ROOT):
                         failures.append(f"{source.relative_to(ROOT)}:{line_number}: "
                                         f"path escapes repository {raw!r}")
