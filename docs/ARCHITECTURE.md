@@ -1,12 +1,20 @@
 # Architecture and acceptance contract
 
+**Navigation:** [Documentation index](INDEX.md) · [Agent playbook](AGENT_PLAYBOOK.md) · [Reuse contract](REUSE.md) · [Operations](OPERATIONS.md) · [Qualification](QUALIFICATION.md)
+
+**Canonical scope:** manifest/schema invariants, deterministic sharding, checkpoint and reduction semantics, security boundaries and measurement definitions. For what to *do* in a consuming repository, start with the [playbook](AGENT_PLAYBOOK.md) and [reusable interface](REUSE.md). For hosted execution and troubleshooting, use [operations](OPERATIONS.md).
+
 ## Scope
+
+**Find related guidance:** [Applicability decision](AGENT_PLAYBOOK.md#applicability-gate) · [Manual benchmark dispatch](OPERATIONS.md#run-the-reference-benchmark) · [Qualification scope](QUALIFICATION.md#accepted-final-head-and-main-qualification).
 
 The first implementation is bulk-synchronous scatter/gather: a planning barrier, optional baseline, independent worker phase, and reduction barrier. The artifact service is the exchange medium. No worker needs another worker's IP address. There is no task-stealing queue, live inter-worker socket protocol, MPI collective, shared filesystem or memory pooling.
 
 The worker matrix supports 1/4/8/16/32 jobs internally; the user-facing benchmark offers 4/8/16/32. A baseline uses the entire manifest, not a smaller sample. The sum of all distributed shards is exactly the baseline's task set.
 
 ## Source and manifest identity
+
+**Integration reference:** [Caller SHA pinning and paths](REUSE.md#external-repository-caller) · [Task/adapter JSON interface](REUSE.md#task-and-adapter-contract).
 
 `schema=1` manifests contain caller source SHA, framework SHA, adapter path/hash, ordered task list, worker/process budget, retry policy and adapter timeout. `experiment_id` is SHA-256 over canonical JSON of all other fields. No timestamp or workflow run ID enters this content identity, permitting compatible cross-run restore. Workflow run and attempt IDs remain in worker evidence for provenance.
 
@@ -15,6 +23,8 @@ Tasks contain exactly `id` and `payload`. IDs are unique restricted strings, pay
 Task receipts bind experiment identity, task ID, input digest and result digest. The hash is an integrity/content identifier, **not a signature or a proof against a malicious worker**. Baseline equality independently checks distributed output consistency, not the scientific validity of the workload implementation. The reference kernel has a separately calculated small-grid test vector.
 
 ## Worker lifecycle and recovery
+
+**Operator actions:** [Checkpoint reruns and explicit restore](OPERATIONS.md#recover-work-after-failure) · [Recovery input and outputs](REUSE.md#outputs-and-recovery).
 
 A worker validates the manifest and adapter file, loads only compatible checkpoints, copies accepted receipts into a fresh output directory, and submits unfinished tasks to a bounded process pool. Successful receipts use temporary-file/fsync/atomic-rename writes. The worker continues collecting other tasks after an ordinary task failure, records failure receipts in `worker.json`, and returns nonzero if any task remains failed. GitHub matrix `fail-fast` is disabled so sibling evidence is retained.
 
@@ -26,6 +36,8 @@ Artifacts are unique per namespace, role/index and GitHub run attempt. Restores 
 
 ## Reduction and evidence
 
+**Evidence inspection:** [Hosted report workflow](OPERATIONS.md#read-results-and-final-telemetry) · [Accepted hosted observations](QUALIFICATION.md#accepted-final-head-and-main-qualification).
+
 Every expected worker must have a complete summary and exactly its assigned receipt filenames. Worker identities, task identities, output digests, task counts, process metadata and timing consistency are checked. Distributed task IDs must be disjoint and complete. If a baseline is enabled, its canonical per-task results must exactly match the distributed results.
 
 `report.json` and `report.md` are written on both normal validation success and rejection. The job exits nonzero on rejection; `always()` publishes diagnostics. A failure before the reducer can start may leave only upstream checkpoints or normal job logs. There is no success fallback for missing artifacts.
@@ -33,6 +45,8 @@ Every expected worker must have a complete summary and exactly its assigned rece
 `quality-aN` contains the exact source snapshot and test output used by the quality job. `NAME-plan-aN` contains the manifest. `NAME-baseline-aN` and `NAME-worker-I-aN` contain receipts and worker summaries. `NAME-report-aN` contains the manifest, reducer report and scheduling telemetry. Artifact retention defaults to seven days, so preserve important qualification records separately.
 
 ## Measurement definitions
+
+**Reading rule:** the table below is the **authoritative definition**, not a promise that an observed figure is eligible for a performance claim. Check [performance claim discipline](OPERATIONS.md#performance-claim-discipline) and the [qualification record](QUALIFICATION.md) before making any scaling statement.
 
 | Field | Definition / caveat |
 |---|---|
@@ -54,8 +68,16 @@ A fresh comparison is suppressed when receipts were restored, tasks retried, bas
 
 ## Security and operational limits
 
+**Required agent rules:** [AGENTS.md](../AGENTS.md#non-negotiable-guardrails) · [Consumer security/dependency expectations](REUSE.md#source-identity-dependencies-and-security).
+
 Only standard `ubuntu-24.04` GitHub-hosted runners are requested. Action references are immutable SHA pins. Permissions are `contents: read` and `actions: read`; checkout credentials are not persisted. The token is exposed only to the artifact action or read-only telemetry step, not explicitly to custom adapters. Do not use `pull_request_target` for running untrusted source. Never inherit deployment or cloud secrets into the compute workflow.
 
 Custom adapters run trusted checked-in code, not a restricted sandbox. The caller must review source revisions, task payloads and adapter behavior. Output hashes do not authenticate provenance against an adversarial workflow author. Artifact retention/storage, platform job limits, service availability and account-wide concurrency remain applicable. The workflow has bounded configurable job timeouts and bounded retries, with no recursion or automatic fan-out beyond the chosen worker count.
 
 Large synchronized worlds, shared-memory workloads, GPUs and very large intermediate data are outside this proof of concept. Add live networking only after a separate workload-specific design and measured justification. Dynamic task scheduling and periodic durable checkpoint publication are useful future extensions, not capabilities claimed here.
+
+## Related implementation and verification
+
+- [Reusable workflow source](../.github/workflows/distributed.yml), [benchmark dispatch](../.github/workflows/benchmark.yml), [smoke CI](../.github/workflows/ci.yml) and [runtime](../hexrunner.py) implement the contracts above.
+- [Adapter example](../examples/adapter.py) and [task input example](../examples/tasks.json) are consumer starting points; [agent adoption playbook](AGENT_PLAYBOOK.md) and [reuse interface](REUSE.md) explain how to use them.
+- [Tests](../tests/) cover logical topologies and rejection paths. [Qualification](QUALIFICATION.md) is the separate record of actual hosted runs; do not promote test coverage to hosted qualification.
